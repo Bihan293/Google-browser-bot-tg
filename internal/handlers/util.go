@@ -1,10 +1,23 @@
 package handlers
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/genspark/tg-browser-bot/internal/store"
 )
+
+// hostOfURL returns the bare hostname (without www.) for a URL, or "".
+func hostOfURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.TrimPrefix(u.Host, "www.")
+}
 
 // ---- HTML escaping helpers ----
 
@@ -20,6 +33,9 @@ func escapeHTML(s string) string {
 }
 
 // escapeAttr escapes a string for use inside an HTML attribute (e.g. href).
+// Currently unused but kept for future link rendering.
+var _ = escapeAttr
+
 func escapeAttr(s string) string {
 	r := strings.NewReplacer(
 		"&", "&amp;",

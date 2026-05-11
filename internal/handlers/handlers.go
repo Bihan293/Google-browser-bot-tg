@@ -3,8 +3,11 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -28,6 +31,12 @@ type Handler struct {
 	HTTP   *search.HTTPClient
 	Page   *render.PageFetcher
 	Store  *store.Store
+
+	// SelfURL — публичный URL самого сервиса (без пути); используется /ping
+	// для самопроверки доступности webhook-сервера снаружи.
+	SelfURL string
+	// StartedAt — момент запуска бота (для /ping uptime).
+	StartedAt time.Time
 }
 
 // New creates a new Handler.
@@ -37,6 +46,7 @@ func New(api *tgbotapi.BotAPI, w *search.WebSearcher, i *search.ImageSearcher,
 	return &Handler{
 		API: api, Web: w, Images: i, Videos: v, News: n,
 		YT: yt, HTTP: httpClient, Page: p, Store: s,
+		StartedAt: time.Now(),
 	}
 }
 
@@ -86,6 +96,9 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	case "ℹ️ Помощь":
 		h.sendHelp(msg.Chat.ID)
+		return
+	case "📡 Пинг":
+		h.handlePing(ctx, msg.Chat.ID)
 		return
 	}
 
@@ -144,6 +157,11 @@ func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		h.openURL(ctx, msg.Chat.ID, ensureScheme(arg), store.KindWeb)
 	case "nsfw", "adult", "18":
 		h.toggleNSFW(msg.Chat.ID)
+	case "ping", "health", "status":
+		h.handlePing(ctx, msg.Chat.ID)
+	case "clear", "reset":
+		h.Store.Delete(msg.Chat.ID)
+		h.reply(msg.Chat.ID, "🧹 Сессия очищена. Пришли новый запрос.")
 	default:
 		h.reply(msg.Chat.ID, "Неизвестная команда. /help — список команд.")
 	}
@@ -156,8 +174,11 @@ func (h *Handler) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 		_, _ = h.API.Request(tgbotapi.NewCallback(cb.ID, ""))
 	}()
 
+	if cb.Message == nil || cb.Message.Chat == nil {
+		return
+	}
 	parts := strings.Split(cb.Data, "|")
-	if len(parts) == 0 {
+	if len(parts) == 0 || parts[0] == "" {
 		return
 	}
 	chatID := cb.Message.Chat.ID
@@ -268,13 +289,20 @@ func (h *Handler) toggleNSFW(chatID int64) {
 
 func (h *Handler) sendStart(chatID int64, name string) {
 	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
-		"<b>Привет, %s!</b>\n\nЯ — Telegram-браузер. Ищу <b>сайты, картинки, видео и новости</b> и показываю их прямо здесь, без перехода наружу.\n\n"+
-			"• Пришли запрос текстом или используй кнопки ниже.\n"+
-			"• Пришли ссылку — открою страницу прямо тут, со всеми картинками и видео.\n"+
-			"• Видео из YouTube проигрываю в чате.\n"+
-			"• Ссылки в результатах — это <b>кнопки</b>: жми, и я открою страницу <i>внутри</i> бота.\n"+
-			"• Кнопка <b>🔞 18+</b> — переключить SafeSearch.\n\n"+
-			"Команды: /help",
+		"<b>👋 Привет, %s!</b>\n\n"+
+			"Я — <b>Telegram-браузер</b>. Ищу <b>сайты, картинки, видео и новости</b> и показываю их прямо здесь, без перехода наружу.\n\n"+
+			"<b>Что я умею:</b>\n"+
+			"🌐 Веб-поиск (DuckDuckGo, без редиректов)\n"+
+			"🖼 Картинки альбомом\n"+
+			"🎥 Видео из YouTube — <b>проигрываю прямо в чате</b>\n"+
+			"📰 Свежие новости с реальными ссылками на издателя\n"+
+			"📄 Открыть любую ссылку — пришли URL\n\n"+
+			"<b>Подсказки:</b>\n"+
+			"• Используй кнопки внизу для выбора режима.\n"+
+			"• Все ссылки в результатах — это <b>кнопки</b>: жми, и я открою страницу <i>внутри</i> бота.\n"+
+			"• <b>🔞 18+</b> — переключить SafeSearch.\n"+
+			"• <b>📡 Пинг</b> — проверить, что сервер бота жив.\n\n"+
+			"Полный список команд: /help",
 		escapeHTML(name),
 	))
 	msg.ParseMode = tgbotapi.ModeHTML
@@ -283,19 +311,77 @@ func (h *Handler) sendStart(chatID int64, name string) {
 }
 
 func (h *Handler) sendHelp(chatID int64) {
-	text := "<b>Команды:</b>\n" +
-		"/search <i>запрос</i> — поиск по сайтам\n" +
-		"/img <i>запрос</i> — поиск картинок\n" +
-		"/vid <i>запрос</i> — поиск видео (проигрываю в чате)\n" +
-		"/news <i>тема</i> — поиск новостей\n" +
-		"/open <i>url</i> — открыть страницу внутри бота\n" +
-		"/nsfw — переключить режим 18+\n\n" +
-		"Можно просто прислать текст — бот найдёт по последнему режиму. " +
-		"Пришли ссылку — бот покажет содержимое страницы здесь же: текст, картинки, видео, " +
-		"а все внутренние ссылки превратятся в кнопки, которые бот открывает сам."
+	text := "<b>📚 Команды бота:</b>\n\n" +
+		"🌐 /search <i>запрос</i> — поиск по сайтам\n" +
+		"🖼 /img <i>запрос</i> — поиск картинок\n" +
+		"🎥 /vid <i>запрос</i> — поиск видео (проигрываю в чате)\n" +
+		"📰 /news <i>тема</i> — свежие новости (реальные ссылки, без Google-редиректа)\n" +
+		"📄 /open <i>url</i> — открыть любую страницу внутри бота\n" +
+		"🔞 /nsfw — переключить режим 18+\n" +
+		"📡 /ping — проверить, что сервер бота жив\n" +
+		"🧹 /clear — сбросить сессию\n" +
+		"ℹ️ /help — эта справка\n\n" +
+		"<b>💡 Подсказки:</b>\n" +
+		"• Просто пришли текст — бот ищет в последнем выбранном режиме.\n" +
+		"• Пришли ссылку — бот покажет содержимое здесь же: текст, картинки, видео.\n" +
+		"• Все внутренние ссылки превратятся в <b>кнопки</b>, которые бот открывает сам, не отправляя тебя наружу."
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = keyboard.MainMenu()
+	_, _ = h.API.Send(msg)
+}
+
+// handlePing — проверка живости. Дёргает свой /health (если известен SelfURL)
+// и отвечает «ok, понял» с метриками.
+func (h *Handler) handlePing(ctx context.Context, chatID int64) {
+	start := time.Now()
+	uptime := time.Since(h.StartedAt).Round(time.Second)
+
+	var b strings.Builder
+	b.WriteString("🏓 <b>pong — ok, понял!</b>\n\n")
+	b.WriteString(fmt.Sprintf("🤖 Бот: <code>@%s</code>\n", escapeHTML(h.API.Self.UserName)))
+	b.WriteString(fmt.Sprintf("⏱ Uptime: <code>%s</code>\n", uptime))
+
+	// Self-check: дёргаем свой /health.
+	if h.SelfURL != "" {
+		healthURL := strings.TrimRight(h.SelfURL, "/") + "/health"
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(rctx, http.MethodGet, healthURL, nil)
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		rtt := time.Since(start).Round(time.Millisecond)
+		if err != nil {
+			b.WriteString(fmt.Sprintf("🌐 Self <code>%s</code>\n", escapeHTML(healthURL)))
+			b.WriteString(fmt.Sprintf("❌ Ошибка: <code>%s</code>\n", escapeHTML(err.Error())))
+		} else {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			status := "✅"
+			if resp.StatusCode >= 400 {
+				status = "⚠️"
+			}
+			b.WriteString(fmt.Sprintf("🌐 Self <code>%s</code>\n", escapeHTML(healthURL)))
+			b.WriteString(fmt.Sprintf("%s HTTP %d • RTT %s\n", status, resp.StatusCode, rtt))
+			if len(body) > 0 {
+				b.WriteString(fmt.Sprintf("📦 <code>%s</code>\n", escapeHTML(truncate(string(body), 200))))
+			}
+		}
+	} else {
+		b.WriteString("🌐 Self URL не сконфигурирован (WEBHOOK_URL пуст) — пинг локально OK.\n")
+	}
+
+	// Telegram round-trip.
+	tgStart := time.Now()
+	if _, err := h.API.GetMe(); err == nil {
+		b.WriteString(fmt.Sprintf("📨 Telegram API: ✅ %s\n", time.Since(tgStart).Round(time.Millisecond)))
+	} else {
+		b.WriteString(fmt.Sprintf("📨 Telegram API: ❌ %s\n", escapeHTML(err.Error())))
+	}
+
+	msg := tgbotapi.NewMessage(chatID, b.String())
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.DisableWebPagePreview = true
 	_, _ = h.API.Send(msg)
 }
 

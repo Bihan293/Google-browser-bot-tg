@@ -265,15 +265,27 @@ func (h *Handler) renderNewsPage(chatID int64, sess *store.Session) {
 		return
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>📰 Новости:</b> <code>%s</code>\n\n", escapeHTML(sess.Query))
+	fmt.Fprintf(&b, "<b>📰 Новости:</b> <code>%s</code> — стр. %d\n\n", escapeHTML(sess.Query), sess.Page+1)
 	for i, it := range items {
 		fmt.Fprintf(&b, "<b>%d.</b> %s\n", i+1, escapeHTML(truncate(it.Title, 160)))
-		if it.Source != "" || it.Date != "" {
-			line := strings.TrimSpace(it.Source + " • " + it.Date)
-			fmt.Fprintf(&b, "<i>%s</i>\n", escapeHTML(line))
+		// Источник • Дата — без двойных разделителей.
+		metaParts := []string{}
+		if it.Source != "" {
+			metaParts = append(metaParts, it.Source)
+		}
+		if it.Date != "" {
+			metaParts = append(metaParts, it.Date)
+		}
+		if len(metaParts) > 0 {
+			fmt.Fprintf(&b, "<i>%s</i>\n", escapeHTML(strings.Join(metaParts, " • ")))
 		}
 		if it.Snippet != "" {
 			fmt.Fprintf(&b, "%s\n", escapeHTML(truncate(it.Snippet, 240)))
+		}
+		// Покажем хост — пусть пользователь видит, что это реальный издатель,
+		// а не news.google.com.
+		if host := hostOfURL(it.URL); host != "" {
+			fmt.Fprintf(&b, "🔗 <code>%s</code>\n", escapeHTML(host))
 		}
 		b.WriteString("\n")
 	}

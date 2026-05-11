@@ -132,17 +132,6 @@ func (h *Handler) sendArticleHeader(chatID int64, art *render.Article) {
 	if title == "" {
 		title = art.URL
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "<b>%s</b>\n", escapeHTML(truncate(title, 200)))
-	fmt.Fprintf(&b, "<code>%s</code>\n\n", escapeHTML(truncate(art.URL, 100)))
-	if art.Description != "" {
-		fmt.Fprintf(&b, "<i>%s</i>\n\n", escapeHTML(truncate(art.Description, 400)))
-	}
-	if art.Text != "" {
-		fmt.Fprint(&b, escapeHTML(truncate(art.Text, 3000)))
-	} else {
-		b.WriteString("<i>Не удалось извлечь читаемый текст со страницы.</i>")
-	}
 
 	// топ-картинка отдельным сообщением (если есть)
 	if art.TopImage != "" {
@@ -154,10 +143,69 @@ func (h *Handler) sendArticleHeader(chatID int64, art *render.Article) {
 		}
 	}
 
-	msg := tgbotapi.NewMessage(chatID, b.String())
-	msg.ParseMode = tgbotapi.ModeHTML
-	msg.DisableWebPagePreview = true
-	_, _ = h.API.Send(msg)
+	// Шапка: заголовок + URL + описание (короткое сообщение).
+	var head strings.Builder
+	fmt.Fprintf(&head, "<b>%s</b>\n", escapeHTML(truncate(title, 250)))
+	fmt.Fprintf(&head, "<code>%s</code>\n", escapeHTML(truncate(art.URL, 120)))
+	if host := hostOfURL(art.URL); host != "" {
+		fmt.Fprintf(&head, "🌐 <i>%s</i>\n", escapeHTML(host))
+	}
+	if art.Description != "" {
+		fmt.Fprintf(&head, "\n<i>%s</i>", escapeHTML(truncate(art.Description, 600)))
+	}
+
+	headMsg := tgbotapi.NewMessage(chatID, head.String())
+	headMsg.ParseMode = tgbotapi.ModeHTML
+	headMsg.DisableWebPagePreview = true
+	_, _ = h.API.Send(headMsg)
+
+	// Тело: разрезаем на куски ≤ 3500 символов, чтобы влезть в лимит Telegram.
+	if art.Text == "" {
+		empty := tgbotapi.NewMessage(chatID, "<i>Не удалось извлечь читаемый текст со страницы.</i>")
+		empty.ParseMode = tgbotapi.ModeHTML
+		_, _ = h.API.Send(empty)
+		return
+	}
+	for _, chunk := range splitTextForTelegram(art.Text, 3500) {
+		m := tgbotapi.NewMessage(chatID, escapeHTML(chunk))
+		m.ParseMode = tgbotapi.ModeHTML
+		m.DisableWebPagePreview = true
+		_, _ = h.API.Send(m)
+	}
+}
+
+// splitTextForTelegram разбивает длинный текст на куски ≤ size рун,
+// стараясь резать по концу абзаца/предложения, без потери содержимого.
+func splitTextForTelegram(s string, size int) []string {
+	if size <= 0 {
+		size = 3500
+	}
+	rs := []rune(s)
+	if len(rs) <= size {
+		return []string{s}
+	}
+	out := []string{}
+	for len(rs) > 0 {
+		if len(rs) <= size {
+			out = append(out, string(rs))
+			break
+		}
+		cut := size
+		// ищем место реза: \n\n, \n, '. ', ' '
+		for _, sep := range []string{"\n\n", "\n", ". ", " "} {
+			if idx := lastIndexRunes(rs[:cut], sep); idx > size/2 {
+				cut = idx + len([]rune(sep))
+				break
+			}
+		}
+		out = append(out, strings.TrimSpace(string(rs[:cut])))
+		rs = rs[cut:]
+	}
+	return out
+}
+
+func lastIndexRunes(rs []rune, sep string) int {
+	return strings.LastIndex(string(rs), sep)
 }
 
 // sendInlineImages — слой картинок альбомами по 10.
@@ -321,15 +369,14 @@ func (h *Handler) playYouTubeByID(ctx context.Context, chatID int64, id, title, 
 	vid.Caption = caption
 	vid.ParseMode = tgbotapi.ModeHTML
 	vid.SupportsStreaming = true
-	if best.Width > 0 {
-		vid.Width = best.Width
-	}
-	if best.Height > 0 {
-		vid.Height = best.Height
-	}
 	if info.LengthSec > 0 {
 		vid.Duration = info.LengthSec
 	}
+	// Note: tgbotapi v5 VideoConfig does not expose Width/Height fields directly;
+	// Telegram derives them from the file. best.Width/Height kept on the format
+	// struct for future use if upstream lib adds support.
+	_ = best.Width
+	_ = best.Height
 	if kind != "" {
 		vid.ReplyMarkup = keyboard.SimpleBackKeyboard(string(kind))
 	}
