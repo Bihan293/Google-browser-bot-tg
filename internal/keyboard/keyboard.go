@@ -34,6 +34,7 @@ func MainMenu() tgbotapi.ReplyKeyboardMarkup {
 		),
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton("🔞 18+"),
+			tgbotapi.NewKeyboardButton("📡 Пинг"),
 			tgbotapi.NewKeyboardButton("ℹ️ Помощь"),
 		),
 	)

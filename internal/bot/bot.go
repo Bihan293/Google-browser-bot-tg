@@ -70,9 +70,27 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(b.cfg.WebhookPath, b.webhookHandler)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "ok")
+	healthHandler := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ok","bot":"`+b.api.Self.UserName+`","ts":"`+time.Now().UTC().Format(time.RFC3339)+`"}`)
+	}
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "pong")
 	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(w, "tg-browser-bot is running. Use Telegram to talk to @"+b.api.Self.UserName)
+	})
+
+	// Make the handler aware of our own base URL so /ping can verify it.
+	b.handler.SelfURL = b.cfg.WebhookURL
 
 	b.srv = &http.Server{
 		Addr:         ":" + b.cfg.Port,
