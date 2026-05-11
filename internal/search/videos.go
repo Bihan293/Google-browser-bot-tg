@@ -23,13 +23,21 @@ func NewVideoSearcher(c *HTTPClient) *VideoSearcher {
 
 var ytInitialRe = regexp.MustCompile(`(?s)var ytInitialData = (\{.*?\});</script>`)
 
-// Search returns up to `limit` video results.
-func (v *VideoSearcher) Search(ctx context.Context, query string, limit int) ([]store.VideoItem, error) {
+// Search returns up to `limit` video results. When nsfw=true we turn off
+// YouTube's restricted mode via the PREF cookie + ?safeSearch=None.
+func (v *VideoSearcher) Search(ctx context.Context, query string, limit int, nsfw bool) ([]store.VideoItem, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 	endpoint := "https://www.youtube.com/results?search_query=" + url.QueryEscape(query) + "&hl=en"
-	body, _, err := v.http.Get(ctx, endpoint)
+	hdrs := map[string]string{}
+	if nsfw {
+		// f2=8000000 disables restricted mode in YouTube PREF cookie.
+		hdrs["Cookie"] = "PREF=f2=8000000&hl=en; CONSENT=YES+1"
+	} else {
+		hdrs["Cookie"] = "CONSENT=YES+1"
+	}
+	body, _, err := v.http.GetWithHeaders(ctx, endpoint, hdrs)
 	if err != nil {
 		return nil, err
 	}
@@ -45,6 +53,9 @@ func (v *VideoSearcher) Search(ctx context.Context, query string, limit int) ([]
 	}
 
 	items := walkVideoRenderers(raw, limit)
+	if len(items) == 0 {
+		items = v.fallbackParse(body, limit)
+	}
 	return items, nil
 }
 
@@ -91,6 +102,7 @@ func parseVideoRenderer(vr map[string]any) store.VideoItem {
 	var item store.VideoItem
 
 	if id, _ := vr["videoId"].(string); id != "" {
+		item.VideoID = id
 		item.URL = "https://www.youtube.com/watch?v=" + id
 	}
 	item.Title = extractRunsText(vr["title"])
@@ -111,6 +123,9 @@ func parseVideoRenderer(vr map[string]any) store.VideoItem {
 				}
 			}
 		}
+	}
+	if item.Thumb == "" && item.VideoID != "" {
+		item.Thumb = "https://i.ytimg.com/vi/" + item.VideoID + "/hqdefault.jpg"
 	}
 	return item
 }
@@ -138,8 +153,7 @@ func extractRunsText(n any) string {
 	return b.String()
 }
 
-// fallbackParse is a very light regex fallback in case the JSON layout
-// changes — extracts /watch?v=ID links from the HTML.
+// fallbackParse: simple regex over the HTML for /watch?v=ID links.
 var watchRe = regexp.MustCompile(`/watch\?v=([A-Za-z0-9_-]{11})`)
 
 func (v *VideoSearcher) fallbackParse(body string, limit int) []store.VideoItem {
@@ -152,9 +166,10 @@ func (v *VideoSearcher) fallbackParse(body string, limit int) []store.VideoItem 
 		}
 		seen[id] = true
 		out = append(out, store.VideoItem{
-			Title: "YouTube video",
-			URL:   "https://www.youtube.com/watch?v=" + id,
-			Thumb: "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg",
+			Title:   "YouTube video",
+			URL:     "https://www.youtube.com/watch?v=" + id,
+			Thumb:   "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg",
+			VideoID: id,
 		})
 		if len(out) >= limit {
 			break

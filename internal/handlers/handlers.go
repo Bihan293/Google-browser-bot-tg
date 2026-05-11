@@ -15,6 +15,7 @@ import (
 )
 
 const perPage = 8
+const linkPagePer = 10 // ссылок-кнопок под открытой страницей на одну страницу
 
 // Handler wires the bot API together with the searchers and session store.
 type Handler struct {
@@ -23,15 +24,19 @@ type Handler struct {
 	Images *search.ImageSearcher
 	Videos *search.VideoSearcher
 	News   *search.NewsSearcher
+	YT     *search.YouTubeFetcher
+	HTTP   *search.HTTPClient
 	Page   *render.PageFetcher
 	Store  *store.Store
 }
 
 // New creates a new Handler.
 func New(api *tgbotapi.BotAPI, w *search.WebSearcher, i *search.ImageSearcher,
-	v *search.VideoSearcher, n *search.NewsSearcher, p *render.PageFetcher, s *store.Store) *Handler {
+	v *search.VideoSearcher, n *search.NewsSearcher, yt *search.YouTubeFetcher,
+	httpClient *search.HTTPClient, p *render.PageFetcher, s *store.Store) *Handler {
 	return &Handler{
-		API: api, Web: w, Images: i, Videos: v, News: n, Page: p, Store: s,
+		API: api, Web: w, Images: i, Videos: v, News: n,
+		YT: yt, HTTP: httpClient, Page: p, Store: s,
 	}
 }
 
@@ -76,6 +81,9 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		h.reply(msg.Chat.ID, "Напиши тему новостей. Пример: <code>искусственный интеллект</code>")
 		h.setMode(msg.Chat.ID, store.KindNews)
 		return
+	case "🔞 18+":
+		h.toggleNSFW(msg.Chat.ID)
+		return
 	case "ℹ️ Помощь":
 		h.sendHelp(msg.Chat.ID)
 		return
@@ -83,7 +91,7 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 
 	// If user sends a URL directly — open the page inside the bot.
 	if isLikelyURL(text) {
-		h.openURL(ctx, msg.Chat.ID, text, store.KindWeb)
+		h.openURL(ctx, msg.Chat.ID, ensureScheme(text), store.KindWeb)
 		return
 	}
 
@@ -133,7 +141,9 @@ func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			h.reply(msg.Chat.ID, "Использование: <code>/open https://...</code>")
 			return
 		}
-		h.openURL(ctx, msg.Chat.ID, arg, store.KindWeb)
+		h.openURL(ctx, msg.Chat.ID, ensureScheme(arg), store.KindWeb)
+	case "nsfw", "adult", "18":
+		h.toggleNSFW(msg.Chat.ID)
 	default:
 		h.reply(msg.Chat.ID, "Неизвестная команда. /help — список команд.")
 	}
@@ -143,7 +153,6 @@ func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 
 func (h *Handler) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	defer func() {
-		// always answer the callback to remove the loading spinner
 		_, _ = h.API.Request(tgbotapi.NewCallback(cb.ID, ""))
 	}()
 
@@ -188,6 +197,57 @@ func (h *Handler) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 			return
 		}
 		h.showCurrentPage(ctx, chatID, store.SearchKind(parts[1]))
+
+	case keyboard.CBURL:
+		if len(parts) < 2 {
+			return
+		}
+		raw := h.Store.ResolveURL(chatID, parts[1])
+		if raw == "" {
+			h.reply(chatID, "Ссылка устарела — повтори действие.")
+			return
+		}
+		h.openURL(ctx, chatID, raw, store.KindWeb)
+
+	case keyboard.CBPlay:
+		if len(parts) < 2 {
+			return
+		}
+		if parts[1] == "all" {
+			h.sendAllPageVideos(ctx, chatID)
+			return
+		}
+		raw := h.Store.ResolveURL(chatID, parts[1])
+		if raw == "" {
+			h.reply(chatID, "Видео устарело — попробуй ещё раз.")
+			return
+		}
+		h.playVideoFromURL(ctx, chatID, raw)
+
+	case keyboard.CBImg:
+		if len(parts) < 2 {
+			return
+		}
+		if parts[1] == "all" {
+			h.sendAllPageImages(ctx, chatID)
+			return
+		}
+		raw := h.Store.ResolveURL(chatID, parts[1])
+		if raw == "" {
+			h.reply(chatID, "Картинка устарела — попробуй ещё раз.")
+			return
+		}
+		h.sendImageURL(chatID, raw, "")
+
+	case keyboard.CBPgLinks:
+		if len(parts) < 2 {
+			return
+		}
+		delta, _ := strconv.Atoi(parts[1])
+		h.changeOpenedPageLinks(chatID, delta)
+
+	case keyboard.CBNSFW:
+		h.toggleNSFW(chatID)
 	}
 }
 
@@ -197,11 +257,23 @@ func (h *Handler) setMode(chatID int64, kind store.SearchKind) {
 	h.Store.Update(chatID, func(s *store.Session) { s.Kind = kind })
 }
 
+func (h *Handler) toggleNSFW(chatID int64) {
+	sess := h.Store.Update(chatID, func(s *store.Session) { s.NSFW = !s.NSFW })
+	state := "выключен"
+	if sess.NSFW {
+		state = "включён ✅"
+	}
+	h.reply(chatID, fmt.Sprintf("🔞 Режим <b>18+</b> %s. SafeSearch у DuckDuckGo и YouTube переключён.", state))
+}
+
 func (h *Handler) sendStart(chatID int64, name string) {
 	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
-		"<b>Привет, %s!</b>\n\nЯ — Telegram-браузер. Ищу <b>сайты, картинки, видео и новости</b> и показываю их прямо здесь, без перехода в Google.\n\n"+
-			"Просто пришли запрос текстом или используй кнопки ниже.\n"+
-			"Также можешь прислать ссылку — я открою страницу и покажу её содержимое.\n\n"+
+		"<b>Привет, %s!</b>\n\nЯ — Telegram-браузер. Ищу <b>сайты, картинки, видео и новости</b> и показываю их прямо здесь, без перехода наружу.\n\n"+
+			"• Пришли запрос текстом или используй кнопки ниже.\n"+
+			"• Пришли ссылку — открою страницу прямо тут, со всеми картинками и видео.\n"+
+			"• Видео из YouTube проигрываю в чате.\n"+
+			"• Ссылки в результатах — это <b>кнопки</b>: жми, и я открою страницу <i>внутри</i> бота.\n"+
+			"• Кнопка <b>🔞 18+</b> — переключить SafeSearch.\n\n"+
 			"Команды: /help",
 		escapeHTML(name),
 	))
@@ -214,11 +286,13 @@ func (h *Handler) sendHelp(chatID int64) {
 	text := "<b>Команды:</b>\n" +
 		"/search <i>запрос</i> — поиск по сайтам\n" +
 		"/img <i>запрос</i> — поиск картинок\n" +
-		"/vid <i>запрос</i> — поиск видео\n" +
+		"/vid <i>запрос</i> — поиск видео (проигрываю в чате)\n" +
 		"/news <i>тема</i> — поиск новостей\n" +
-		"/open <i>url</i> — открыть страницу внутри бота\n\n" +
+		"/open <i>url</i> — открыть страницу внутри бота\n" +
+		"/nsfw — переключить режим 18+\n\n" +
 		"Можно просто прислать текст — бот найдёт по последнему режиму. " +
-		"Пришли ссылку — бот покажет содержимое страницы здесь же."
+		"Пришли ссылку — бот покажет содержимое страницы здесь же: текст, картинки, видео, " +
+		"а все внутренние ссылки превратятся в кнопки, которые бот открывает сам."
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = keyboard.MainMenu()
@@ -234,4 +308,16 @@ func (h *Handler) reply(chatID int64, text string) {
 
 func (h *Handler) sendError(chatID int64, err error) {
 	h.reply(chatID, "⚠️ Ошибка: <code>"+escapeHTML(err.Error())+"</code>")
+}
+
+// ensureScheme — гарантирует, что URL начинается с http(s)://.
+func ensureScheme(u string) string {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return u
+	}
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	return "https://" + u
 }

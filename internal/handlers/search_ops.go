@@ -65,7 +65,6 @@ func (h *Handler) changePage(ctx context.Context, chatID int64, kind store.Searc
 }
 
 // loadPage makes sure session has results for the requested page index.
-// If not, performs the search with a larger limit to fill the cache.
 func (h *Handler) loadPage(ctx context.Context, sess *store.Session, kind store.SearchKind, page int) error {
 	needed := (page + 1) * perPage
 
@@ -75,7 +74,7 @@ func (h *Handler) loadPage(ctx context.Context, sess *store.Session, kind store.
 		if have >= needed {
 			return nil
 		}
-		res, err := h.Web.Search(ctx, sess.Query, needed+perPage)
+		res, err := h.Web.Search(ctx, sess.Query, needed+perPage, sess.NSFW)
 		if err != nil {
 			return err
 		}
@@ -85,7 +84,7 @@ func (h *Handler) loadPage(ctx context.Context, sess *store.Session, kind store.
 		if have >= needed {
 			return nil
 		}
-		res, err := h.Images.Search(ctx, sess.Query, needed+perPage)
+		res, err := h.Images.Search(ctx, sess.Query, needed+perPage, sess.NSFW)
 		if err != nil {
 			return err
 		}
@@ -95,7 +94,7 @@ func (h *Handler) loadPage(ctx context.Context, sess *store.Session, kind store.
 		if have >= needed {
 			return nil
 		}
-		res, err := h.Videos.Search(ctx, sess.Query, needed+perPage)
+		res, err := h.Videos.Search(ctx, sess.Query, needed+perPage, sess.NSFW)
 		if err != nil {
 			return err
 		}
@@ -134,6 +133,8 @@ func (h *Handler) showCurrentPage(ctx context.Context, chatID int64, kind store.
 	}
 }
 
+// renderWebPage — список результатов БЕЗ кликабельных href: только текст
+// + inline-кнопки с номерами, чтобы открытие шло через бота.
 func (h *Handler) renderWebPage(chatID int64, sess *store.Session) {
 	items := pageOrEmpty(sess.WebResults, sess.Page)
 	if len(items) == 0 {
@@ -143,12 +144,13 @@ func (h *Handler) renderWebPage(chatID int64, sess *store.Session) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<b>🌐 Web:</b> <code>%s</code>\n\n", escapeHTML(sess.Query))
 	for i, it := range items {
-		fmt.Fprintf(&b, "<b>%d.</b> <a href=\"%s\">%s</a>\n", i+1, escapeAttr(it.URL), escapeHTML(truncate(it.Title, 120)))
+		fmt.Fprintf(&b, "<b>%d.</b> %s\n", i+1, escapeHTML(truncate(it.Title, 140)))
 		if it.Snippet != "" {
-			fmt.Fprintf(&b, "<i>%s</i>\n", escapeHTML(truncate(it.Snippet, 220)))
+			fmt.Fprintf(&b, "<i>%s</i>\n", escapeHTML(truncate(it.Snippet, 240)))
 		}
 		fmt.Fprintf(&b, "<code>%s</code>\n\n", escapeHTML(truncate(it.URL, 80)))
 	}
+	b.WriteString("👇 Нажми номер, чтобы открыть результат <b>в боте</b>.")
 	msg := tgbotapi.NewMessage(chatID, b.String())
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.DisableWebPagePreview = true
@@ -163,7 +165,7 @@ func (h *Handler) renderImagesPage(ctx context.Context, chatID int64, sess *stor
 		return
 	}
 
-	// Send as media group (album) – max 10 per group.
+	// Send as media group (album).
 	var media []interface{}
 	max := len(items)
 	if max > 10 {
@@ -181,13 +183,10 @@ func (h *Handler) renderImagesPage(ctx context.Context, chatID int64, sess *stor
 	}
 	mg := tgbotapi.NewMediaGroup(chatID, media)
 	if _, err := h.API.SendMediaGroup(mg); err != nil {
-		// Fallback: send a text list with links if media group fails.
-		var b strings.Builder
-		fmt.Fprintf(&b, "<b>🖼 Картинки:</b> <code>%s</code>\n\n", escapeHTML(sess.Query))
-		for i, it := range items {
-			fmt.Fprintf(&b, "<b>%d.</b> <a href=\"%s\">%s</a>\n", i+1, escapeAttr(it.ImageURL), escapeHTML(truncate(it.Title, 100)))
+		// Fallback — выкладываем по одной, через bot-side download.
+		for i := 0; i < max; i++ {
+			h.sendImageURL(chatID, items[i].ImageURL, fmt.Sprintf("%d. %s", i+1, truncate(items[i].Title, 80)))
 		}
-		h.reply(chatID, b.String())
 	}
 
 	// follow-up message with controls
@@ -198,16 +197,47 @@ func (h *Handler) renderImagesPage(ctx context.Context, chatID int64, sess *stor
 	_ = ctx
 }
 
+// renderVideosPage — выкладывает альбомом превью видео (как у картинок),
+// плюс кнопки «номер» открывают видео В ЧАТЕ (через Invidious).
 func (h *Handler) renderVideosPage(chatID int64, sess *store.Session) {
 	items := pageOrEmptyVid(sess.VideoResults, sess.Page)
 	if len(items) == 0 {
 		h.reply(chatID, "Видео не найдено по запросу <code>"+escapeHTML(sess.Query)+"</code>.")
 		return
 	}
+
+	// Альбом из превьюшек
+	var media []interface{}
+	max := len(items)
+	if max > 10 {
+		max = 10
+	}
+	for i := 0; i < max; i++ {
+		it := items[i]
+		if it.Thumb == "" {
+			continue
+		}
+		photo := tgbotapi.NewInputMediaPhoto(tgbotapi.FileURL(it.Thumb))
+		cap := fmt.Sprintf("%d. %s", i+1, truncate(it.Title, 80))
+		if it.Author != "" {
+			cap += " — " + truncate(it.Author, 30)
+		}
+		if it.Duration != "" {
+			cap += " (" + it.Duration + ")"
+		}
+		photo.Caption = cap
+		media = append(media, photo)
+	}
+	if len(media) > 0 {
+		mg := tgbotapi.NewMediaGroup(chatID, media)
+		_, _ = h.API.SendMediaGroup(mg)
+	}
+
+	// Текстовый список + кнопки управления
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>🎥 Видео:</b> <code>%s</code>\n\n", escapeHTML(sess.Query))
+	fmt.Fprintf(&b, "<b>🎥 Видео:</b> <code>%s</code> — стр. %d\n\n", escapeHTML(sess.Query), sess.Page+1)
 	for i, it := range items {
-		fmt.Fprintf(&b, "<b>%d.</b> <a href=\"%s\">%s</a>\n", i+1, escapeAttr(it.URL), escapeHTML(truncate(it.Title, 120)))
+		fmt.Fprintf(&b, "<b>%d.</b> %s\n", i+1, escapeHTML(truncate(it.Title, 140)))
 		meta := []string{}
 		if it.Author != "" {
 			meta = append(meta, escapeHTML(it.Author))
@@ -220,6 +250,7 @@ func (h *Handler) renderVideosPage(chatID int64, sess *store.Session) {
 		}
 		b.WriteString("\n")
 	}
+	b.WriteString("▶️ Нажми номер, чтобы <b>проиграть видео в чате</b>.")
 	msg := tgbotapi.NewMessage(chatID, b.String())
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.DisableWebPagePreview = true
@@ -236,16 +267,17 @@ func (h *Handler) renderNewsPage(chatID int64, sess *store.Session) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<b>📰 Новости:</b> <code>%s</code>\n\n", escapeHTML(sess.Query))
 	for i, it := range items {
-		fmt.Fprintf(&b, "<b>%d.</b> <a href=\"%s\">%s</a>\n", i+1, escapeAttr(it.URL), escapeHTML(truncate(it.Title, 140)))
+		fmt.Fprintf(&b, "<b>%d.</b> %s\n", i+1, escapeHTML(truncate(it.Title, 160)))
 		if it.Source != "" || it.Date != "" {
 			line := strings.TrimSpace(it.Source + " • " + it.Date)
 			fmt.Fprintf(&b, "<i>%s</i>\n", escapeHTML(line))
 		}
 		if it.Snippet != "" {
-			fmt.Fprintf(&b, "%s\n", escapeHTML(truncate(it.Snippet, 220)))
+			fmt.Fprintf(&b, "%s\n", escapeHTML(truncate(it.Snippet, 240)))
 		}
 		b.WriteString("\n")
 	}
+	b.WriteString("👇 Нажми номер, чтобы открыть статью <b>в боте</b>.")
 	msg := tgbotapi.NewMessage(chatID, b.String())
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.DisableWebPagePreview = true
