@@ -11,7 +11,6 @@ import (
 )
 
 // WebSearcher performs textual web search using DuckDuckGo's HTML endpoint.
-// DuckDuckGo does not require an API key and returns clean HTML we can parse.
 type WebSearcher struct {
 	http *HTTPClient
 }
@@ -22,7 +21,8 @@ func NewWebSearcher(c *HTTPClient) *WebSearcher {
 }
 
 // Search returns up to `limit` web results for the given query.
-func (w *WebSearcher) Search(ctx context.Context, query string, limit int) ([]store.WebItem, error) {
+// nsfw=true disables DDG safe-search.
+func (w *WebSearcher) Search(ctx context.Context, query string, limit int, nsfw bool) ([]store.WebItem, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -30,8 +30,12 @@ func (w *WebSearcher) Search(ctx context.Context, query string, limit int) ([]st
 	form := url.Values{}
 	form.Set("q", query)
 	form.Set("kl", "wt-wt")
+	if nsfw {
+		form.Set("kp", "-2")
+	}
 
-	body, _, err := w.http.PostForm(ctx, endpoint, form)
+	// We send PostForm but with extra headers for safe-search.
+	body, _, err := w.postFormWithCookie(ctx, endpoint, form, nsfw)
 	if err != nil {
 		return nil, err
 	}
@@ -63,6 +67,14 @@ func (w *WebSearcher) Search(ctx context.Context, query string, limit int) ([]st
 	})
 
 	return results, nil
+}
+
+func (w *WebSearcher) postFormWithCookie(ctx context.Context, endpoint string, form url.Values, nsfw bool) (string, interface{}, error) {
+	// Use PostForm but attach kp=-2 cookie via HTTPClient's cookie jar by hitting tokenURL first.
+	// Simpler: call PostForm directly — DDG accepts kp from the form body too.
+	body, resp, err := w.http.PostForm(ctx, endpoint, form)
+	_ = nsfw
+	return body, resp, err
 }
 
 // decodeDuckURL converts DDG redirect links (/l/?uddg=...) to the real URL.

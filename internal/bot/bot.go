@@ -37,7 +37,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	api.Debug = cfg.Debug
 	log.Printf("authorized on telegram account: @%s", api.Self.UserName)
 
-	httpClient := search.NewHTTPClient(15 * time.Second)
+	httpClient := search.NewHTTPClient(20 * time.Second)
 	pageFetcher := render.NewPageFetcher(func(ctx context.Context, u string) (string, error) {
 		body, _, err := httpClient.Get(ctx, u)
 		return body, err
@@ -50,6 +50,8 @@ func New(cfg *config.Config) (*Bot, error) {
 		search.NewImageSearcher(httpClient),
 		search.NewVideoSearcher(httpClient),
 		search.NewNewsSearcher(httpClient),
+		search.NewYouTubeFetcher(httpClient),
+		httpClient,
 		pageFetcher,
 		sessions,
 	)
@@ -76,8 +78,8 @@ func (b *Bot) Run(ctx context.Context) error {
 		Addr:         ":" + b.cfg.Port,
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  180 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -109,10 +111,6 @@ func (b *Bot) registerWebhook() error {
 	if err != nil {
 		return fmt.Errorf("build webhook: %w", err)
 	}
-	// NB: library v5.5.1 doesn't expose SecretToken on WebhookConfig.
-	// We still validate the X-Telegram-Bot-Api-Secret-Token header in the
-	// HTTP handler when WEBHOOK_SECRET is configured; Telegram will send it
-	// if the webhook was registered with a secret out-of-band.
 	if _, err := b.api.Request(wh); err != nil {
 		return fmt.Errorf("set webhook: %w", err)
 	}
@@ -150,14 +148,13 @@ func (b *Bot) webhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process the update asynchronously so we can return 200 immediately.
 	go func(u tgbotapi.Update) {
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("panic in handler: %v", rec)
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 		defer cancel()
 		b.handler.HandleUpdate(ctx, u)
 	}(update)

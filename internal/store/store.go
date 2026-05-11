@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"sync"
 	"time"
 )
@@ -21,12 +23,30 @@ type Session struct {
 	Query     string
 	Kind      SearchKind
 	Page      int
+	NSFW      bool
 	UpdatedAt time.Time
 	// Cached results (URLs / titles) per kind; key = page index
 	WebResults   [][]WebItem
 	ImageResults [][]ImageItem
 	VideoResults [][]VideoItem
 	NewsResults  [][]NewsItem
+
+	// Links found on the last opened page, addressable by callback.
+	OpenedURL   string
+	PageLinks   []PageLink
+	PageImages  []string
+	PageVideos  []string
+	PageTitle   string
+
+	// LinkMap maps short ids (8 hex chars) to full URLs the bot has
+	// shown to the user — so callbacks like o|<id> can open them.
+	LinkMap map[string]string
+}
+
+// PageLink — гиперссылка, найденная на открытой странице.
+type PageLink struct {
+	Text string
+	URL  string
 }
 
 // WebItem is a simple web search result.
@@ -41,6 +61,7 @@ type ImageItem struct {
 	Title    string
 	ImageURL string
 	Source   string
+	PageURL  string
 }
 
 // VideoItem is a video result (YouTube etc.)
@@ -50,6 +71,7 @@ type VideoItem struct {
 	Author   string
 	Duration string
 	Thumb    string
+	VideoID  string // YouTube id, if known
 }
 
 // NewsItem is a news/article result.
@@ -99,12 +121,37 @@ func (s *Store) Update(chatID int64, fn func(sess *Session)) *Session {
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[chatID]
 	if !ok {
-		sess = &Session{}
+		sess = &Session{LinkMap: map[string]string{}}
 		s.sessions[chatID] = sess
+	}
+	if sess.LinkMap == nil {
+		sess.LinkMap = map[string]string{}
 	}
 	fn(sess)
 	sess.UpdatedAt = time.Now()
 	return sess
+}
+
+// RegisterURL puts a URL into the session's link map and returns a short id
+// that can be embedded into Telegram callback_data (< 64 bytes total).
+func (s *Store) RegisterURL(chatID int64, rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	id := shortID(rawURL)
+	s.Update(chatID, func(sess *Session) {
+		sess.LinkMap[id] = rawURL
+	})
+	return id
+}
+
+// ResolveURL returns a previously registered URL by its short id, or "".
+func (s *Store) ResolveURL(chatID int64, id string) string {
+	sess := s.Get(chatID)
+	if sess == nil || sess.LinkMap == nil {
+		return ""
+	}
+	return sess.LinkMap[id]
 }
 
 // Delete removes the session for a chat.
@@ -130,4 +177,9 @@ func (s *Store) gcLoop() {
 		}
 		s.mu.Unlock()
 	}
+}
+
+func shortID(s string) string {
+	h := sha1.Sum([]byte(s))
+	return hex.EncodeToString(h[:4]) // 8 hex chars
 }
