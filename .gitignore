@@ -1,0 +1,25 @@
+# Binaries
+/bin/
+/tg-browser-bot
+/cmd/bot/bot
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Env files
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
